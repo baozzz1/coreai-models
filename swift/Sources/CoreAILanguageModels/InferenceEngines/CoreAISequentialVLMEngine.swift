@@ -57,7 +57,8 @@ public struct VLMModelConfig: InferenceConfiguration, Codable, Sendable {
 ///
 /// 4. **LLM decoder** (`main`):
 ///    - Inputs: `in_embeddings` (Float16/BFloat16), `position_ids` (Int32)
-///    - States: `keyCache`, `valueCache` (persistent KV cache)
+///    - States: `keyCache`, `valueCache` (persistent KV cache) plus any fixed-shape
+///      persistent states declared by hybrid decoders (conv / recurrent)
 ///    - Output: `logits` (Float16, shape `[1, seq_len, vocab_size]`)
 ///
 /// ## Inference Flow
@@ -110,10 +111,12 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     /// KV cache state, managed by the shared state-handler infrastructure
     /// (allocation, 2x growth, copy-on-grow, reset) — identical to `CoreAISequentialEngine`.
     private var kvCache: any SyncStateHandler
-    /// Additional non-KV states (nil for the VLM's two-state KV contract; carried for symmetry).
+    /// Additional non-KV states: the fixed-shape conv/recurrent states a hybrid
+    /// linear-attention decoder declares next to its KV pair. Nil for a full-attention
+    /// decoder, whose only states are the KV pair.
     private var additionalStates: FixedNDArrayState?
     /// True if any state is non-truncatable (conv/recurrent). Gates partial `reset(to:)`,
-    /// matching `CoreAISequentialEngine`. False for every current full-attention VLM.
+    /// matching `CoreAISequentialEngine`. False for every full-attention VLM.
     private let hasNonTruncatableStates: Bool
     private var logitsArray: NDArray
     private var cachedLogitsBatchSize: Int
@@ -232,9 +235,12 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                 "VLM LLM function expected 2 inputs (in_embeddings, position_ids), "
                     + "got \(llmDesc.inputNames.count): \(llmDesc.inputNames)")
         }
-        guard llmDesc.stateNames.count == 2 else {
+        // Hybrid-attention decoders (e.g. Qwen3.5) carry fixed-size conv/recurrent
+        // states beyond the KV pair; the shared state-handler factory classifies them
+        // and this engine binds and resets them alongside the cache.
+        guard llmDesc.stateNames.count >= 2 else {
             throw InferenceRuntimeError.invalidOutputType(
-                "VLM LLM function expected 2 states (KV cache), "
+                "VLM LLM function expected at least 2 states (KV cache), "
                     + "got \(llmDesc.stateNames.count): \(llmDesc.stateNames)")
         }
         guard llmDesc.outputNames.count >= 1 else {
@@ -287,6 +293,10 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             "VLM KV cache: capacity=\(stateHandlers.kvCache.currentCapacity), "
                 + "states=\(stateHandlers.kvCache.stateNames)"
         )
+        if let additionalStates = stateHandlers.additionalStates {
+            CLILogger.log(
+                "VLM additional persistent states: \(additionalStates.stateNames)")
+        }
 
         // Allocate initial logits (1 token)
         let initLogitsDesc = logitsDesc.resolvingDynamicDimensions([1, 1, config.vocabSize])
