@@ -44,7 +44,8 @@ public struct VLMModelConfig: InferenceConfiguration, Codable, Sendable {
 /// Manages four model functions (potentially from separate `.aimodel` bundles):
 ///
 /// 1. **Vision encoder** (`encode_image`):
-///    - Input: `pixel_values` (Float32, shape `[1, 3, H, W]`)
+///    - Input: `pixel_values` (Float32, shape `[1, 3, H, W]`, or `[1, num_patches,
+///      patch_dim]` for pre-patchified exports — see `VisionPatchify`)
 ///    - Output: encoder hidden states (Float32, shape `[1, num_patches, vision_hidden_dim]`)
 ///
 /// 2. **Vision projector** (`project`):
@@ -85,6 +86,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     private let projectFunction: InferenceFunction
     private let projectFunctionDescriptor: InferenceFunctionDescriptor
     private let visionProjectorFused: Bool
+    /// Non-nil when the vision function takes `[1, num_patches, patch_dim]`.
+    private let visionPatchify: VisionPatchify?
 
     // MARK: - Embed Model Handle
 
@@ -203,6 +206,25 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             }
             self.visionFunction = visionFn
             self.projectFunction = visionFn
+        }
+
+        // A rank-3 pixel input is the pre-patchified ANE form: the host owns the
+        // patchify. Rank 4 is [1, 3, H, W] and takes the CHW buffer unchanged.
+        let visionPixelName = self.visionFunctionDescriptor.inputNames[0]
+        guard
+            case .ndArray(let visionPixelDesc) = self.visionFunctionDescriptor.inputDescriptor(
+                of: visionPixelName)
+        else {
+            throw InferenceRuntimeError.invalidInputType(
+                "Cannot get descriptor for vision input '\(visionPixelName)'")
+        }
+        if visionPixelDesc.shape.count == 3 {
+            self.visionPatchify = try VisionPatchify(
+                visionConfig: config.visionConfig,
+                numPatches: visionPixelDesc.shape[1],
+                patchDim: visionPixelDesc.shape[2])
+        } else {
+            self.visionPatchify = nil
         }
 
         // --- Embed pipeline ---
@@ -325,7 +347,9 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         )
 
         CLILogger.log(
-            "CoreAI VLM engine initialized — vision: encode_image+project, "
+            "CoreAI VLM engine initialized — vision: encode_image+project "
+                + "(\(visionPixelName) \(visionPixelDesc.shape), "
+                + "\(visionPatchify == nil ? "CHW" : "host patchify")), "
                 + "embed: \(embedFunctionName), llm: \(config.function)"
         )
     }
@@ -363,7 +387,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             cgImage: cgImage, strategy: config.visionConfig.imageStrategy)
 
         // Step 2: Run encode_image
-        let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
+        let encoderOutput = try await runVisionEncoder(pixels: visionInput(fromCHW: chwPixels))
 
         // Step 3: Run projector (skip if fused with encoder)
         let projectedEmbeddings =
@@ -389,6 +413,29 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         )
     }
 
+    /// Preprocess an image into the CHW pixel buffer `visionInput(fromCHW:)` consumes.
+    /// Exposed so benchmarks can time the encoder forward separately from image I/O.
+    public func preprocessImage(cgImage: CGImage) throws -> [Float] {
+        try imagePreprocessor.preprocessCHW(
+            cgImage: cgImage, strategy: config.visionConfig.imageStrategy)
+    }
+
+    /// Turn CHW pixels into the buffer this bundle's vision function takes: the
+    /// patch rows of a pre-patchified export, or the CHW pixels themselves.
+    /// Exposed so benchmarks can time the rearrangement separately from the forward.
+    public func visionInput(fromCHW pixels: [Float]) throws -> [Float] {
+        guard let visionPatchify else { return pixels }
+        return try visionPatchify(chw: pixels)
+    }
+
+    /// Run the vision encoder (+ projector when separate) on a buffer from
+    /// `visionInput(fromCHW:)`.
+    public func visionForward(pixels: [Float]) async throws -> NDArray {
+        let encoderOutput = try await runVisionEncoder(pixels: pixels)
+        return visionProjectorFused
+            ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
+    }
+
     // MARK: - Video Encoding (MultimodalInferenceEngine)
 
     /// Encode video frames into concatenated embeddings.
@@ -408,7 +455,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         for try await frame in video.frames {
             let chwPixels = try imagePreprocessor.preprocessCHW(
                 cgImage: frame.image, strategy: config.visionConfig.imageStrategy)
-            let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
+            let encoderOutput = try await runVisionEncoder(pixels: visionInput(fromCHW: chwPixels))
             let projected =
                 visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
             frameEmbeddings.append(projected)
@@ -466,9 +513,10 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         )
     }
 
-    /// Run the vision encoder on preprocessed pixel values.
+    /// Run the vision encoder on the model-ready pixel buffer.
     ///
-    /// - Parameter pixels: Float32 array in CHW layout, shape `[3, H, W]`
+    /// - Parameter pixels: Float32 array matching the vision function's declared
+    ///   input — CHW `[3, H, W]`, or patch rows from `visionInput(fromCHW:)`
     /// - Returns: NDArray of encoder hidden states
     private func runVisionEncoder(pixels: [Float]) async throws -> NDArray {
         let pixelInputName = visionFunctionDescriptor.inputNames[0]
@@ -481,12 +529,23 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                 "Cannot get descriptor for vision input '\(pixelInputName)'")
         }
 
-        // Shape: [1, 3, imageSize, imageSize]
+        // Dynamic dims resolve to the CHW image shape; a fully static descriptor
+        // (the pre-patchified form) is used as declared.
+        let declaredShape = (0..<pixelDesc.shape.count).map { pixelDesc.shape[$0] }
         let imageSize = config.visionConfig.imageSize
-        let resolvedPixelDesc = pixelDesc.resolvingDynamicDimensions([1, 3, imageSize, imageSize])
+        let resolvedPixelDesc =
+            declaredShape.contains(where: { $0 < 0 })
+            ? pixelDesc.resolvingDynamicDimensions([1, 3, imageSize, imageSize])
+            : pixelDesc.resolvingDynamicDimensions(declaredShape)
         var pixelArray = NDArray(descriptor: resolvedPixelDesc)
 
-        // Fill with CHW pixel data
+        let expectedCount = (0..<resolvedPixelDesc.shape.count)
+            .reduce(1) { $0 * resolvedPixelDesc.shape[$1] }
+        guard pixels.count == expectedCount else {
+            throw InferenceRuntimeError.invalidArgument(
+                "Vision input '\(pixelInputName)' takes \(expectedCount) floats "
+                    + "(\(resolvedPixelDesc.shape)), got \(pixels.count)")
+        }
         fillNDArray(&pixelArray, as: Float.self, with: pixels)
 
         // Resolve output descriptor
