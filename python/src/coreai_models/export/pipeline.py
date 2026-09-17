@@ -44,6 +44,7 @@ from coreai_models.export.presets import (
     DEFAULT_MACOS_COMPRESSION_PRESET,
     get_preset,
 )
+from coreai_models.models.base import TraceSpec
 from coreai_models.models.registry import get_model_entry
 
 logger = logging.getLogger(__name__)
@@ -198,11 +199,6 @@ async def _async_export_model(config: ExportConfig) -> str:
             f"max_position_embeddings ({native_max_ctx}). Choose a value <= {native_max_ctx}."
         )
 
-    if max_context_length is not None:
-        hf_config.max_position_embeddings = max_context_length
-    if config.num_layers is not None:
-        hf_config.num_hidden_layers = config.num_layers
-
     logger.info(f"Loading {config.hf_model_id} ({config.variant}, dtype={target_dtype})...")
 
     # Memory-efficient layer-by-layer loading + quantizer disk-checkpointing
@@ -239,6 +235,11 @@ async def _async_export_model(config: ExportConfig) -> str:
                 disable_embedding_quantization=config.disable_embedding_quantization,
             )
         model = model.eval()
+        # The model's class truncates and re-scopes the config as its own layers need —
+        # `layer_types` alongside `num_hidden_layers`, for instance. Everything downstream
+        # reads shapes off the config, so it reads the one the model was built from.
+        hf_config = model.config
+
         # ---- 3. Resolve compression preset ----
         if config.compression_config_object is not None:
             torch_quantization_config, torch_palettization_config = split_compression_config(
@@ -257,8 +258,6 @@ async def _async_export_model(config: ExportConfig) -> str:
         effective_max_ctx = max_context_length or getattr(
             hf_config, "max_position_embeddings", TRACE_KV_CACHE_SEQ_LEN
         )
-        vocab_size = hf_config.vocab_size
-        batch_size = 1
         # Set when composite ops are marked for externalization before quantization.
         externalized_model: torch.nn.Module | None = None
         if torch_quantization_config is not None:
@@ -316,33 +315,10 @@ async def _async_export_model(config: ExportConfig) -> str:
         if torch_palettization_config is not None:
             assert config.variant == "iOS", "palettization is only supported for iOS variant."
 
-            query_len = 8
-            input_ids = torch.randint(1, vocab_size, (batch_size, query_len), dtype=torch.int32)
-            position_ids = (
-                torch.arange(query_len).to(torch.uint16).unsqueeze(0).expand(batch_size, query_len)
-            )
-            in_step = torch.zeros((1,), dtype=torch.int32)
-            causal_mask = torch.zeros(1, effective_max_ctx, 1, query_len, dtype=torch.float16)
-            if hasattr(hf_config, "head_dim") and isinstance(hf_config.head_dim, int):
-                head_dim = hf_config.head_dim
-            else:
-                head_dim = hf_config.hidden_size // hf_config.num_attention_heads
-            key_cache = torch.zeros(
-                hf_config.num_hidden_layers,
-                1,  # batch_size
-                hf_config.num_key_value_heads * head_dim,
-                1,
-                effective_max_ctx,
-                dtype=torch.float16,
-            )
-            value_cache = key_cache.clone()
-            palettization_inputs = (
-                input_ids,
-                position_ids,
-                in_step,
-                causal_mask,
-                key_cache,
-                value_cache,
+            palettization_inputs = model.build_compression_inputs(
+                hf_config,
+                target_dtype,
+                TraceSpec(max_context_length=effective_max_ctx, cache_seq_len=effective_max_ctx),
             )
             model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
 

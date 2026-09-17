@@ -118,6 +118,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.ios.olmo2 import Olmo2ForCausalLMForiOS
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
+    from coreai_models.models.ios.qwen3_5 import Qwen3_5ForCausalLMForiOS
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
     from coreai_models.models.macos.gemma3n import Gemma3nForCausalLM
     from coreai_models.models.macos.gpt_oss import GptOssForCausalLM
@@ -129,6 +130,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.phi3 import Phi3ForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
+    from coreai_models.models.macos.qwen3_5 import Qwen3_5ForCausalLM
     from coreai_models.models.macos.qwen3_moe import Qwen3MoeForCausalLM
     from coreai_models.models.macos.qwen3_vl import (
         Qwen3VLForCausalLM,
@@ -185,6 +187,17 @@ def _get_registry() -> dict[str, ModelEntry]:
             macos_class=Qwen3ForCausalLM,
             ios_class=Qwen3ForCausalLMForiOS,
         ),
+        # Qwen3.5: hybrid linear/full attention. macos_class is the text decoder;
+        # the vision tower is not exported. The prefix stops inside
+        # "model.language_model." so that stripping it leaves the decoder's own
+        # parameter names (model.layers.N.*, model.embed_tokens, model.norm), which
+        # are what from_hf_memory_efficient indexes by layer and assigns.
+        "qwen3_5_text": ModelEntry(
+            macos_class=Qwen3_5ForCausalLM,
+            ios_class=Qwen3_5ForCausalLMForiOS,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_",
+        ),
         "qwen3_moe": ModelEntry(
             macos_class=Qwen3MoeForCausalLM,
         ),
@@ -205,6 +218,7 @@ MODEL_TYPE_REMAPPING: dict[str, str] = {
     "gemma3n": "gemma3n_text",
     "muse_glimmer": "muse_glimmer_text",
     "qwen2_5": "qwen2",
+    "qwen3_5": "qwen3_5_text",
 }
 
 

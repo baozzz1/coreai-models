@@ -35,3 +35,8 @@ python/.venv/
 exports/
 /*.jpeg
 /*.png
+
+# Spike export artifacts
+spike_qwen35/*.aimodel/
+spike_qwen35/bundle/
+spike_qwen35/*.log
